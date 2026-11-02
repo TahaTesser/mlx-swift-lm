@@ -101,6 +101,43 @@ public enum GuidedGenerationLoop {
         prefill: PrefillParameters = .init(stepSize: PrefillParameters.defaultStepSize),
         emit: (String) -> Bool
     ) throws -> Int {
+        try run(
+            input: input, context: context, constraint: constraint, maxTokens: maxTokens,
+            vocabSize: vocabSize, kvCache: kvCache, kvBits: kvBits, kvGroupSize: kvGroupSize,
+            quantizedKVStart: quantizedKVStart, completionReserve: completionReserve,
+            hardReserve: hardReserve, closingBias: closingBias, whitespaceBias: whitespaceBias,
+            whitespaceTokenIDs: whitespaceTokenIDs, diagnosticLog: diagnosticLog, prefill: prefill,
+            promptCache: nil, emit: emit
+        ).generated
+    }
+
+    /// Runs the guided generation loop like
+    /// ``run(input:context:constraint:maxTokens:vocabSize:kvCache:kvBits:kvGroupSize:quantizedKVStart:completionReserve:hardReserve:closingBias:whitespaceBias:whitespaceTokenIDs:diagnosticLog:prefill:emit:)``,
+    /// reusing `promptCache` for the start this prompt shares with the last one, and keeping
+    /// this prompt's cache in it afterward.
+    ///
+    /// - Returns: The tokens generated (including FF tokens), and the prompt tokens the cache
+    ///   already held, which weren't read again.
+    package static func run(
+        input: LMInput,
+        context: ModelContext,
+        constraint: GrammarConstraint,
+        maxTokens: Int,
+        vocabSize: Int,
+        kvCache: KVCacheConfiguration? = nil,
+        kvBits: Int? = nil,
+        kvGroupSize: Int = 64,
+        quantizedKVStart: Int = 0,
+        completionReserve: Int = 64,
+        hardReserve: Int = 0,
+        closingBias: MLXArray? = nil,
+        whitespaceBias: MLXArray? = nil,
+        whitespaceTokenIDs: Set<Int> = [],
+        diagnosticLog: Bool = false,
+        prefill: PrefillParameters = .init(stepSize: PrefillParameters.defaultStepSize),
+        promptCache: PromptCache?,
+        emit: (String) -> Bool
+    ) throws -> (generated: Int, reused: Int) {
         let model = context.model
         let diagnosticSink = GuidedGenerationDiagnosticSink.current
         let generationParameters = GenerateParameters(
@@ -109,10 +146,10 @@ public enum GuidedGenerationLoop {
             kvGroupSize: kvGroupSize,
             quantizedKVStart: quantizedKVStart)
         let kvCachePlan = try generationParameters.kvCachePlan()
-        let cacheStorage = try kvCachePlan.validated(
-            KVCacheStorage(
-                try model.newCache(parameters: generationParameters), plan: kvCachePlan))
-        var modelState: LMOutput.State?
+        let prompt = promptCache == nil ? [] : input.text.tokens.asArray(Int.self)
+        let (cacheStorage, reused) = try Self.cache(
+            for: prompt, input: input, model: model, parameters: generationParameters,
+            plan: kvCachePlan, promptCache: promptCache)
 
         // Build EOS token set
         let stopTokenIDs = Self.buildStopTokenIDs(
@@ -120,29 +157,9 @@ public enum GuidedGenerationLoop {
             configuration: context.configuration
         )
 
-        // Prefill prompt and get first set of logits
-        var logits: MLXArray
-        let inputLength = input.text.cacheSequenceLength
-        switch try model.prepare(
-            input, cache: cacheStorage.cache, state: nil, prefill: prefill)
-        {
-        case .tokens(let tokens):
-            let remainingLength = tokens.cacheSequenceLength
-            precondition(
-                remainingLength <= inputLength,
-                "LanguageModel.prepare returned more tokens than it received")
-            cacheStorage.commitProcessedTokens(inputLength - remainingLength)
-            let result = model(
-                tokens[text: .newAxis], cache: cacheStorage.cache, state: nil)
-            cacheStorage.commitProcessedTokens(remainingLength)
-            modelState = result.state
-            logits = result.logits
-
-        case .logits(let result):
-            cacheStorage.commitProcessedTokens(inputLength)
-            modelState = result.state
-            logits = result.logits
-        }
+        // Prefill the prompt's unread part and get the first set of logits
+        var (logits, modelState) = try Self.read(
+            Self.unread(input, after: reused), model: model, into: cacheStorage, prefill: prefill)
 
         try kvCachePlan.applyAndValidate(to: cacheStorage)
 
@@ -478,7 +495,85 @@ public enum GuidedGenerationLoop {
             throw GuidedGenerationError.incompleteOutput
         }
 
-        return tokenCount
+        // A model that carries state besides its cache can't resume from the cache alone.
+        if let promptCache, modelState == nil {
+            promptCache.keep(cacheStorage, for: prompt)
+        }
+        return (tokenCount, reused)
+    }
+
+    /// Reads a prompt into `promptCache` without generating, so that a guided request whose
+    /// prompt starts the same way reads only the rest.
+    ///
+    /// - Returns: The prompt tokens the cache already held, which weren't read again.
+    @discardableResult
+    package static func prefill(
+        input: LMInput,
+        context: ModelContext,
+        promptCache: PromptCache,
+        prefill: PrefillParameters = .init(stepSize: PrefillParameters.defaultStepSize)
+    ) throws -> Int {
+        let generationParameters = GenerateParameters()
+        let kvCachePlan = try generationParameters.kvCachePlan()
+        let prompt = input.text.tokens.asArray(Int.self)
+        let (cacheStorage, reused) = try Self.cache(
+            for: prompt, input: input, model: context.model, parameters: generationParameters,
+            plan: kvCachePlan, promptCache: promptCache)
+        let (logits, modelState) = try Self.read(
+            Self.unread(input, after: reused), model: context.model, into: cacheStorage,
+            prefill: prefill)
+        // Evaluating the logits writes the prompt's keys and values into the cache.
+        eval(logits)
+        if modelState == nil {
+            promptCache.keep(cacheStorage, for: prompt)
+        }
+        return reused
+    }
+
+    /// Returns a cache for a prompt and the tokens it already holds: the prompt cache's, trimmed
+    /// to the start the prompts share, or a new cache.
+    private static func cache(
+        for prompt: [Int], input: LMInput, model: any LanguageModel,
+        parameters: GenerateParameters, plan: KVCachePlan, promptCache: PromptCache?
+    ) throws -> (storage: KVCacheStorage, reused: Int) {
+        let makeCache = {
+            try plan.validated(
+                KVCacheStorage(try model.newCache(parameters: parameters), plan: plan))
+        }
+        guard let promptCache else { return (try makeCache(), 0) }
+        return try promptCache.cache(for: prompt, input: input, plan: plan, makeCache: makeCache)
+    }
+
+    /// Returns the part of a prompt after the tokens a cache already holds.
+    private static func unread(_ input: LMInput, after reused: Int) -> LMInput {
+        reused == 0 ? input : LMInput(text: input.text[text: reused...])
+    }
+
+    /// Prefills a prompt into a cache, returning the logits of its last token and the model's
+    /// state.
+    private static func read(
+        _ input: LMInput, model: any LanguageModel, into cacheStorage: KVCacheStorage,
+        prefill: PrefillParameters
+    ) throws -> (logits: MLXArray, state: LMOutput.State?) {
+        let inputLength = input.text.cacheSequenceLength
+        switch try model.prepare(
+            input, cache: cacheStorage.cache, state: nil, prefill: prefill)
+        {
+        case .tokens(let tokens):
+            let remainingLength = tokens.cacheSequenceLength
+            precondition(
+                remainingLength <= inputLength,
+                "LanguageModel.prepare returned more tokens than it received")
+            cacheStorage.commitProcessedTokens(inputLength - remainingLength)
+            let result = model(
+                tokens[text: .newAxis], cache: cacheStorage.cache, state: nil)
+            cacheStorage.commitProcessedTokens(remainingLength)
+            return (result.logits, result.state)
+
+        case .logits(let result):
+            cacheStorage.commitProcessedTokens(inputLength)
+            return (result.logits, result.state)
+        }
     }
 
     // MARK: - Internal (visible for testing)

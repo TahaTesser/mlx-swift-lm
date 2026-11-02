@@ -272,6 +272,15 @@ public struct MLXLanguageModel: FoundationModels.LanguageModel, Sendable {
     /// Prompt prefill step size; `nil` uses the default step size.
     public let prefillStepSize: Int?
 
+    /// Whether schema-guided requests reuse the cache of the last prompt the model read, up to
+    /// where the two prompts first differ, and `session.prewarm()` reads the session's prompt
+    /// into that cache.
+    ///
+    /// Sessions that send the same long instructions with a different request each time, such
+    /// as a classifier or a planner, then read only what follows the shared start. The cache
+    /// stays in memory between requests, holding about one prompt's keys and values.
+    public let reusesPromptCache: Bool
+
     /// Configuration the framework uses to create and cache executors.
     public var executorConfiguration: Executor.Configuration {
         Executor.Configuration(modelID: modelID)
@@ -291,6 +300,8 @@ public struct MLXLanguageModel: FoundationModels.LanguageModel, Sendable {
     ///   - configurationResolver: Patches a per-call ``ModelConfiguration``
     ///     (reasoning config, extra stop tokens) for this instance.
     ///   - prefillStepSize: Prompt prefill step size. `nil` uses the default step size.
+    ///   - reusesPromptCache: Whether schema-guided requests reuse the last prompt's cache up to
+    ///     where the prompts differ, and prewarming reads the session's prompt into it.
     ///   - weightsLocation: Resolves a model identifier to its on-disk weights
     ///     directory, for the availability checks.
     ///   - load: Loads the model container for a configuration.
@@ -308,6 +319,7 @@ public struct MLXLanguageModel: FoundationModels.LanguageModel, Sendable {
         configurationResolver: any ModelConfigurationResolver =
             DefaultConfigurationResolver(),
         prefillStepSize: Int? = nil,
+        reusesPromptCache: Bool = false,
         weightsLocation: @Sendable @escaping (String) -> URL,
         load: @escaping ContainerLoader
     ) {
@@ -315,6 +327,7 @@ public struct MLXLanguageModel: FoundationModels.LanguageModel, Sendable {
         self.capabilities = LanguageModelCapabilities(capabilities)
         self.configurationResolver = configurationResolver
         self.prefillStepSize = prefillStepSize
+        self.reusesPromptCache = reusesPromptCache
         self.weightsLocation = weightsLocation
         self.load = load
     }
@@ -358,7 +371,7 @@ public struct MLXLanguageModel: FoundationModels.LanguageModel, Sendable {
     /// fire-and-forget by ``Executor/prewarm(model:transcript:)``, reached
     /// publicly through `session.prewarm()`. Safe to call multiple times and
     /// concurrently; subsequent calls reuse the cached container.
-    func warmUp() async throws {
+    func warmUp(transcript: Transcript? = nil) async throws {
         // Distinguish a warmup of an already-present model (suppress the
         // spurious `.available → .downloading → .available` flip) from a
         // genuine first fetch (which still reports `.downloading`). Conditioning
@@ -409,6 +422,21 @@ public struct MLXLanguageModel: FoundationModels.LanguageModel, Sendable {
             ) {
                 // Drain to completion.
             }
+        }
+
+        // Read the session's prompt so far into the prompt cache, so its next
+        // schema-guided request reads only what follows it.
+        guard reusesPromptCache, let transcript else { return }
+        let messages = try TranscriptConverter.mlxMessages(for: transcript)
+        guard !messages.isEmpty else { return }
+        let promptCache = await Self.cache.promptCache(modelID: modelID)
+        let prefillStepSize = self.prefillStepSize
+        try await container.perform(nonSendable: messages) { context, messages in
+            defer { Stream.gpu.synchronize() }
+            let input = try await context.processor.prepare(input: UserInput(chat: messages))
+            try GuidedGenerationLoop.prefill(
+                input: input, context: context, promptCache: promptCache.cache,
+                prefill: .init(stepSize: prefillStepSize ?? PrefillParameters.defaultStepSize))
         }
     }
 
@@ -639,12 +667,13 @@ public struct MLXLanguageModel: FoundationModels.LanguageModel, Sendable {
         ///
         /// - Parameters:
         ///   - model: The live model instance to warm.
-        ///   - transcript: Accepted per protocol; the shader warmup uses a
-        ///     fixed dummy prompt and does not depend on it.
+        ///   - transcript: The session's transcript. The shader warmup uses a
+        ///     fixed dummy prompt; a model that reuses its prompt cache also
+        ///     reads the transcript into it.
         public func prewarm(model: MLXLanguageModel, transcript: Transcript) {
             Task {
                 do {
-                    try await model.warmUp()
+                    try await model.warmUp(transcript: transcript)
                 } catch {
                     Self.logger.error(
                         "MLX prewarm failed for \(model.modelID): \(error.localizedDescription)"
@@ -691,6 +720,9 @@ public struct MLXLanguageModel: FoundationModels.LanguageModel, Sendable {
                 from: request.enabledToolDefinitions)
 
             let container = try await model.loadContainer()
+            let promptCache =
+                model.reusesPromptCache
+                ? await MLXLanguageModel.cache.promptCache(modelID: model.modelID) : nil
 
             // Encode schema to JSON if present
             let schemaJSON: String?
@@ -1003,6 +1035,7 @@ public struct MLXLanguageModel: FoundationModels.LanguageModel, Sendable {
                                     modelID: modelID,
                                     requestedMaxTokens: requestedMaxTokens,
                                     prefillStepSize: prefillStepSize,
+                                    promptCache: nil,
                                     entryID: entryID,
                                     context: context,
                                     channel: channel)
@@ -1196,6 +1229,7 @@ public struct MLXLanguageModel: FoundationModels.LanguageModel, Sendable {
                             modelID: modelID,
                             requestedMaxTokens: requestedMaxTokens,
                             prefillStepSize: prefillStepSize,
+                            promptCache: promptCache,
                             entryID: entryID,
                             context: context,
                             channel: channel)
@@ -1441,6 +1475,7 @@ public struct MLXLanguageModel: FoundationModels.LanguageModel, Sendable {
             modelID: String,
             requestedMaxTokens: Int?,
             prefillStepSize: Int?,
+            promptCache: SharedPromptCache?,
             entryID: String,
             context: ModelContext,
             channel: LanguageModelExecutorGenerationChannel
@@ -1478,8 +1513,9 @@ public struct MLXLanguageModel: FoundationModels.LanguageModel, Sendable {
 
             var incomplete = false
             var generatedTokenCount: Int?
+            var cachedTokenCount = 0
             do {
-                generatedTokenCount = try GuidedGenerationLoop.run(
+                (generatedTokenCount, cachedTokenCount) = try GuidedGenerationLoop.run(
                     input: input,
                     context: context,
                     constraint: constraint,
@@ -1490,7 +1526,8 @@ public struct MLXLanguageModel: FoundationModels.LanguageModel, Sendable {
                     closingBias: bias.closing,
                     whitespaceBias: bias.whitespace,
                     whitespaceTokenIDs: bias.whitespaceTokenIDs,
-                    prefill: .init(stepSize: prefillStepSize ?? PrefillParameters.defaultStepSize)
+                    prefill: .init(stepSize: prefillStepSize ?? PrefillParameters.defaultStepSize),
+                    promptCache: promptCache?.cache
                 ) { text in
                     textContinuation.yield(text)
                     GuidedGenerationDiagnosticSink.current?.recordEmit()
@@ -1517,7 +1554,7 @@ public struct MLXLanguageModel: FoundationModels.LanguageModel, Sendable {
                 await Self.emitUsage(
                     input: .init(
                         totalTokenCount: input.text.tokens.size,
-                        cachedTokenCount: 0),
+                        cachedTokenCount: cachedTokenCount),
                     output: .init(
                         totalTokenCount: generatedTokenCount,
                         reasoningTokenCount: 0),

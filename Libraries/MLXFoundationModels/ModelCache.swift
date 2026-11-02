@@ -69,6 +69,16 @@ actor ModelCache {
     /// load. Surfaced through `MLXLanguageModel.availability` so callers can
     /// distinguish "never tried" from "tried and failed".
     private var lastErrors: [String: any Error] = [:]
+    /// Each model's prompt cache, which its schema-guided requests share.
+    private var promptCaches: [String: SharedPromptCache] = [:]
+
+    /// Returns the model's prompt cache, making it on first use.
+    func promptCache(modelID: String) -> SharedPromptCache {
+        if let promptCache = promptCaches[modelID] { return promptCache }
+        let promptCache = SharedPromptCache()
+        promptCaches[modelID] = promptCache
+        return promptCache
+    }
 
     /// Gets the cached model container for the given model ID, loading it if necessary.
     /// Concurrent callers for the same model will share the same loading task, preventing duplicate loads.
@@ -269,6 +279,7 @@ actor ModelCache {
         constraintTemplates.removeAll()
         tokenizerBiases.removeAll()
         lastErrors.removeAll()
+        promptCaches.removeAll()
     }
 
     /// Evicts a single model's state across every per-model cache: its container,
@@ -291,7 +302,17 @@ actor ModelCache {
         }
         tokenizerBiases.removeValue(forKey: modelID)
         lastErrors.removeValue(forKey: modelID)
+        promptCaches.removeValue(forKey: modelID)
     }
+}
+
+/// A model's prompt cache, which its schema-guided requests share.
+///
+/// Its cache is used only inside the model container's `perform`, which
+/// serializes every generation and prewarm on the model, so it's safe to hand
+/// between them.
+final class SharedPromptCache: @unchecked Sendable {
+    let cache = PromptCache()
 }
 
 #endif  // canImport(FoundationModels)
