@@ -853,6 +853,21 @@ public struct MLXLanguageModel: FoundationModels.LanguageModel, Sendable {
                     // baseline `input` rendered above.
                     let effectiveInput = suppressedInput ?? input
 
+                    // A schema-guided answer is decoded straight into the schema,
+                    // which leaves no room for thinking, so its prompt renders with
+                    // thinking off wherever the template can turn it off.
+                    let schemaInput: LMInput
+                    if request.schema != nil, enabledToolDefinitions.isEmpty,
+                        let reasoningConfig = resolved.reasoningConfig,
+                        let thinkingOff = try? reasoningConfig.promptStrategy
+                            .additionalContext(forThinkingEnabled: false)
+                    {
+                        schemaInput = try await context.processor.prepare(
+                            input: UserInput(chat: messages, additionalContext: thinkingOff))
+                    } else {
+                        schemaInput = input
+                    }
+
                     // Tool path, entered on every round while tools are enabled
                     // -- fresh turns and continuations alike. Allowed mode uses
                     // native generation so the model can answer or call a tool;
@@ -1177,7 +1192,7 @@ public struct MLXLanguageModel: FoundationModels.LanguageModel, Sendable {
                     } else if let schemaJSON {
                         try await runSchemaGeneration(
                             schemaJSON: schemaJSON,
-                            input: input,
+                            input: schemaInput,
                             modelID: modelID,
                             requestedMaxTokens: requestedMaxTokens,
                             prefillStepSize: prefillStepSize,
